@@ -153,7 +153,7 @@ def load_default_pdf(pdf_path: str = PDF_PATH) -> None:
 
     log.info("Embeddings built and saved — %d chunks.", len(chunks))
 
-
+load_default_pdf()
 # ─────────────────────────────────────────
 # ROUTES
 # ─────────────────────────────────────────
@@ -276,6 +276,5 @@ def root():
 # ENTRY POINT  (dev only — use Gunicorn in prod)
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    load_default_pdf()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port, debug=False)
