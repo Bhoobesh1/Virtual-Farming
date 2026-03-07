@@ -197,7 +197,7 @@ def ask():
 
         # Prevent hallucination
         if distances[0][0] > DISTANCE_THRESHOLD:
-
+            
             return jsonify({
                 "answer": "Sorry, I could not find relevant information in the document."
             })
