@@ -1,8 +1,10 @@
 flask
 flask-cors
+flask-limiter
 openai
 PyPDF2
 faiss-cpu
 numpy
 sentence-transformers
 gunicorn
+openpyxl
