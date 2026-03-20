@@ -734,5 +734,5 @@ def internal_error(e):
 # ENTRY POINT  (dev only — use Gunicorn in prod)
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8081))
+    port = int(os.environ.get("PORT", 8082))
     app.run(host="0.0.0.0", port=port, debug=False)
