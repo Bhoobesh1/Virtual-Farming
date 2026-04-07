@@ -59,15 +59,14 @@ MAX_SESSION_ID_LEN   = int(os.getenv("MAX_SESSION_ID_LEN",         "64"))
 MAX_TOKENS_RESPONSE  = int(os.getenv("MAX_TOKENS_RESPONSE",        "500"))
 OPENAI_TIMEOUT       = int(os.getenv("OPENAI_TIMEOUT",              "30"))
 UNANSWERED_LOG_FILE  = os.getenv("UNANSWERED_LOG_FILE", "unanswered_questions.xlsx")
+LEADS_LOG_FILE       = os.getenv("LEADS_LOG_FILE",       "leads.xlsx")
 MAX_SESSIONS_PER_IP  = int(os.getenv("MAX_SESSIONS_PER_IP",         "10"))
 
-# Phrase the LLM uses when it cannot answer from context
-# We detect this to decide whether to log the question
 _NO_DETAIL_PHRASE_EN = "I don't have that detail right now"
-_NO_DETAIL_PHRASE_TA = "இப்போது அந்த விவரம் என்னிடம் இல்லை"   # Tamil equivalent if ever used
+_NO_DETAIL_PHRASE_TA = "இப்போது அந்த விவரம் என்னிடம் இல்லை"
 
 # ─────────────────────────────────────────
-# CORS  — lock to your frontend domain(s)
+# CORS
 # ─────────────────────────────────────────
 _raw_origins = os.getenv("ALLOWED_ORIGINS", "*")
 CORS(
@@ -79,7 +78,7 @@ CORS(
 )
 
 # ─────────────────────────────────────────
-# RATE LIMITING  (in-memory, no Redis)
+# RATE LIMITING
 # ─────────────────────────────────────────
 limiter = Limiter(
     get_remote_address,
@@ -101,7 +100,6 @@ client = OpenAI(api_key=_openai_key)
 # ─────────────────────────────────────────
 
 def check_api_key():
-    """Validate X-API-Key header using constant-time comparison."""
     if not API_SECRET:
         return None
     provided = request.headers.get("X-API-Key", "").strip()
@@ -112,7 +110,6 @@ def check_api_key():
 
 
 def require_api_key(f):
-    """Decorator — apply API key check to any route."""
     @wraps(f)
     def decorated(*args, **kwargs):
         err = check_api_key()
@@ -123,10 +120,6 @@ def require_api_key(f):
 
 
 def sanitize_input(text: str) -> str:
-    """
-    Strip prompt-injection attempts and unsafe characters.
-    Allows: Latin, Tamil Unicode (U+0B80–U+0BFF), common punctuation.
-    """
     text = re.sub(
         r"(ignore|forget|disregard|override)\s+(all\s+)?(previous\s+)?"
         r"(instructions?|prompts?|system|rules?|context)",
@@ -147,7 +140,6 @@ def sanitize_input(text: str) -> str:
 
 
 def validate_session_id(sid: str) -> str:
-    """Return a safe session ID (new UUID if invalid)."""
     if not sid or len(sid) > MAX_SESSION_ID_LEN:
         return str(uuid.uuid4())
     if not re.fullmatch(r"[a-zA-Z0-9\-]+", sid):
@@ -156,7 +148,7 @@ def validate_session_id(sid: str) -> str:
 
 
 # ─────────────────────────────────────────
-# SECURITY HEADERS  (applied to all responses)
+# SECURITY HEADERS
 # ─────────────────────────────────────────
 @app.after_request
 def add_security_headers(response):
@@ -176,6 +168,10 @@ def add_security_headers(response):
 _sessions: dict[str, dict] = {}
 _sessions_lock = threading.Lock()
 _ip_session_count: dict[str, int] = defaultdict(int)
+
+# Stores verified leads in memory: session_id -> lead info
+_verified_leads: dict[str, dict] = {}
+_leads_lock = threading.Lock()
 
 
 def _cleanup_expired_sessions() -> None:
@@ -204,7 +200,6 @@ def get_session_history(session_id: str) -> list[dict]:
 
 
 def create_or_update_session(session_id: str, question: str, answer: str, ip: str) -> bool:
-    """Returns False if session cannot be created (limits exceeded)."""
     with _sessions_lock:
         if session_id in _sessions:
             s = _sessions[session_id]
@@ -247,15 +242,202 @@ def active_session_count() -> int:
 
 
 # ─────────────────────────────────────────
+# LEAD VALIDATION HELPERS
+# ─────────────────────────────────────────
+
+# Comprehensive country dial codes (ISO alpha-2 → dial code)
+COUNTRY_DIAL_CODES = {
+    "AF":"+93","AL":"+355","DZ":"+213","AD":"+376","AO":"+244","AG":"+1-268","AR":"+54",
+    "AM":"+374","AU":"+61","AT":"+43","AZ":"+994","BS":"+1-242","BH":"+973","BD":"+880",
+    "BB":"+1-246","BY":"+375","BE":"+32","BZ":"+501","BJ":"+229","BT":"+975","BO":"+591",
+    "BA":"+387","BW":"+267","BR":"+55","BN":"+673","BG":"+359","BF":"+226","BI":"+257",
+    "CV":"+238","KH":"+855","CM":"+237","CA":"+1","CF":"+236","TD":"+235","CL":"+56",
+    "CN":"+86","CO":"+57","KM":"+269","CG":"+242","CD":"+243","CR":"+506","HR":"+385",
+    "CU":"+53","CY":"+357","CZ":"+420","DK":"+45","DJ":"+253","DM":"+1-767","DO":"+1-809",
+    "EC":"+593","EG":"+20","SV":"+503","GQ":"+240","ER":"+291","EE":"+372","SZ":"+268",
+    "ET":"+251","FJ":"+679","FI":"+358","FR":"+33","GA":"+241","GM":"+220","GE":"+995",
+    "DE":"+49","GH":"+233","GR":"+30","GD":"+1-473","GT":"+502","GN":"+224","GW":"+245",
+    "GY":"+592","HT":"+509","HN":"+504","HU":"+36","IS":"+354","IN":"+91","ID":"+62",
+    "IR":"+98","IQ":"+964","IE":"+353","IL":"+972","IT":"+39","JM":"+1-876","JP":"+81",
+    "JO":"+962","KZ":"+7","KE":"+254","KI":"+686","KP":"+850","KR":"+82","KW":"+965",
+    "KG":"+996","LA":"+856","LV":"+371","LB":"+961","LS":"+266","LR":"+231","LY":"+218",
+    "LI":"+423","LT":"+370","LU":"+352","MG":"+261","MW":"+265","MY":"+60","MV":"+960",
+    "ML":"+223","MT":"+356","MH":"+692","MR":"+222","MU":"+230","MX":"+52","FM":"+691",
+    "MD":"+373","MC":"+377","MN":"+976","ME":"+382","MA":"+212","MZ":"+258","MM":"+95",
+    "NA":"+264","NR":"+674","NP":"+977","NL":"+31","NZ":"+64","NI":"+505","NE":"+227",
+    "NG":"+234","MK":"+389","NO":"+47","OM":"+968","PK":"+92","PW":"+680","PA":"+507",
+    "PG":"+675","PY":"+595","PE":"+51","PH":"+63","PL":"+48","PT":"+351","QA":"+974",
+    "RO":"+40","RU":"+7","RW":"+250","KN":"+1-869","LC":"+1-758","VC":"+1-784","WS":"+685",
+    "SM":"+378","ST":"+239","SA":"+966","SN":"+221","RS":"+381","SC":"+248","SL":"+232",
+    "SG":"+65","SK":"+421","SI":"+386","SB":"+677","SO":"+252","ZA":"+27","SS":"+211",
+    "ES":"+34","LK":"+94","SD":"+249","SR":"+597","SE":"+46","CH":"+41","SY":"+963",
+    "TW":"+886","TJ":"+992","TZ":"+255","TH":"+66","TL":"+670","TG":"+228","TO":"+676",
+    "TT":"+1-868","TN":"+216","TR":"+90","TM":"+993","TV":"+688","UG":"+256","UA":"+380",
+    "AE":"+971","GB":"+44","US":"+1","UY":"+598","UZ":"+998","VU":"+678","VE":"+58",
+    "VN":"+84","YE":"+967","ZM":"+260","ZW":"+263"
+}
+
+# Phone length rules per country (min, max digits after dial code)
+PHONE_LENGTH_RULES = {
+    "IN": (10, 10), "US": (10, 10), "CA": (10, 10), "GB": (10, 11),
+    "AU": (9, 9),   "AE": (9, 9),   "SA": (9, 9),   "SG": (8, 8),
+    "PK": (10, 10), "BD": (10, 10), "LK": (9, 9),   "MY": (9, 10),
+    "PH": (10, 10), "ID": (9, 12),  "NG": (10, 10), "ZA": (9, 9),
+    "KE": (9, 9),   "EG": (10, 10), "BR": (10, 11), "MX": (10, 10),
+    "AR": (10, 10), "DE": (10, 12), "FR": (9, 9),   "IT": (9, 11),
+    "ES": (9, 9),   "NL": (9, 9),   "BE": (9, 9),   "SE": (9, 9),
+    "CH": (9, 9),   "PL": (9, 9),   "RU": (10, 10), "JP": (10, 11),
+    "KR": (9, 10),  "CN": (11, 11), "TH": (9, 9),   "VN": (9, 10),
+    "TR": (10, 10), "IR": (10, 10), "IQ": (10, 10), "QA": (8, 8),
+    "KW": (8, 8),   "BH": (8, 8),   "OM": (8, 8),
+}
+
+
+def validate_name(name: str) -> tuple[bool, str]:
+    name = name.strip()
+    if len(name) < 2:
+        return False, "Name must be at least 2 characters."
+    if len(name) > 80:
+        return False, "Name is too long."
+    if not re.match(r"^[\w\u0B80-\u0BFF\s.\-']+$", name):
+        return False, "Name contains invalid characters."
+    if re.search(r"\d", name):
+        return False, "Name should not contain numbers."
+    return True, ""
+
+
+def validate_email(email: str) -> tuple[bool, str]:
+    email = email.strip().lower()
+    pattern = r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+    if not re.match(pattern, email):
+        return False, "Please enter a valid email address."
+    if len(email) > 254:
+        return False, "Email is too long."
+    return True, ""
+
+
+def validate_phone(country_code: str, phone: str) -> tuple[bool, str]:
+    """
+    country_code: ISO alpha-2 (e.g. "IN")
+    phone: digits only, without dial code
+    """
+    country_code = country_code.upper().strip()
+    phone = re.sub(r"\D", "", phone)  # strip non-digits
+
+    if country_code not in COUNTRY_DIAL_CODES:
+        return False, "Unknown country code."
+
+    min_len, max_len = PHONE_LENGTH_RULES.get(country_code, (7, 15))
+    if not (min_len <= len(phone) <= max_len):
+        return False, f"Phone number must be {min_len}–{max_len} digits for the selected country."
+
+    return True, ""
+
+
+# ─────────────────────────────────────────
+# LEAD EXCEL LOGGER
+# ─────────────────────────────────────────
+_leads_excel_lock = threading.Lock()
+
+LEADS_HEADERS = ["#", "DateTime", "Name", "Email", "CountryCode", "DialCode", "Phone", "FullPhone", "Language", "SessionID", "IP"]
+
+
+def _init_leads_excel_if_needed(path: str) -> None:
+    if os.path.exists(path):
+        return
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Leads"
+
+    header_font  = Font(bold=True, color="FFFFFF", size=11)
+    header_fill  = PatternFill("solid", fgColor="1B5E20")
+    header_align = Alignment(horizontal="center", vertical="center")
+
+    for col_idx, header in enumerate(LEADS_HEADERS, start=1):
+        cell           = ws.cell(row=1, column=col_idx, value=header)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = header_align
+
+    col_widths = [5, 22, 25, 35, 14, 12, 15, 20, 12, 38, 18]
+    for i, width in enumerate(col_widths, start=1):
+        ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
+
+    ws.row_dimensions[1].height = 22
+    ws.freeze_panes = "A2"
+
+    wb.save(path)
+    log.info("Created leads log: %s", path)
+
+
+def log_lead_to_excel(
+    name:        str,
+    email:       str,
+    country_code: str,
+    phone:       str,
+    language:    str,
+    session_id:  str,
+    ip:          str,
+) -> None:
+    """Append one lead row to the Excel file. Thread-safe."""
+    try:
+        with _leads_excel_lock:
+            _init_leads_excel_if_needed(LEADS_LOG_FILE)
+            wb       = openpyxl.load_workbook(LEADS_LOG_FILE)
+            ws       = wb.active
+            next_row = ws.max_row + 1
+            row_num  = next_row - 1
+
+            fill_color = "E8F5E9" if row_num % 2 == 0 else "FFFFFF"
+            row_fill   = PatternFill("solid", fgColor=fill_color)
+
+            dial_code = COUNTRY_DIAL_CODES.get(country_code.upper(), "")
+            full_phone = f"{dial_code}{phone}"
+            timestamp  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            row_data = [
+                row_num, timestamp, name, email,
+                country_code.upper(), dial_code, phone, full_phone,
+                language, session_id, ip
+            ]
+
+            for col_idx, value in enumerate(row_data, start=1):
+                cell           = ws.cell(row=next_row, column=col_idx, value=value)
+                cell.fill      = row_fill
+                cell.alignment = Alignment(vertical="center", wrap_text=(col_idx == 4))
+
+            wb.save(LEADS_LOG_FILE)
+            log.info("Logged lead (row %d): %s | %s", row_num, name, email)
+
+    except Exception as e:
+        log.error("Failed to log lead: %s", e)
+
+
+def leads_count() -> int:
+    try:
+        if not os.path.exists(LEADS_LOG_FILE):
+            return 0
+        with _leads_excel_lock:
+            wb = openpyxl.load_workbook(LEADS_LOG_FILE, read_only=True)
+            ws = wb.active
+            count = max(0, ws.max_row - 1)
+            wb.close()
+            return count
+    except Exception:
+        return 0
+
+
+# ─────────────────────────────────────────
 # UNANSWERED QUESTION LOGGER
 # ─────────────────────────────────────────
 _excel_lock = threading.Lock()
 
-EXCEL_HEADERS = ["#", "DateTime", "Question", "Language", "SessionID", "IP", "FAISSDistance"]
+# ── Email column added here ───────────────────────────────────────────────────
+EXCEL_HEADERS = ["#", "DateTime", "Question", "Language", "SessionID", "IP", "FAISSDistance", "Email"]
 
 
 def _init_excel_if_needed(path: str) -> None:
-    """Create the Excel file with styled headers if it doesn't exist."""
     if os.path.exists(path):
         return
 
@@ -273,7 +455,8 @@ def _init_excel_if_needed(path: str) -> None:
         cell.fill      = header_fill
         cell.alignment = header_align
 
-    col_widths = [5, 22, 65, 12, 38, 18, 16]
+    # ── Column widths updated for 8 columns (Email added at the end) ──────────
+    col_widths = [5, 22, 65, 12, 38, 18, 16, 35]
     for i, width in enumerate(col_widths, start=1):
         ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = width
 
@@ -290,8 +473,8 @@ def log_unanswered_question(
     session_id: str,
     ip:         str,
     distance:   float,
+    email:      str = "",        # ── new parameter ────────────────────────────
 ) -> None:
-    """Append one row to the Excel log. Thread-safe."""
     try:
         with _excel_lock:
             _init_excel_if_needed(UNANSWERED_LOG_FILE)
@@ -304,7 +487,9 @@ def log_unanswered_question(
             row_fill   = PatternFill("solid", fgColor=fill_color)
 
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            row_data  = [row_num, timestamp, question, language, session_id, ip, round(distance, 4)]
+
+            # ── Email appended as the last field ─────────────────────────────
+            row_data  = [row_num, timestamp, question, language, session_id, ip, round(distance, 4), email]
 
             for col_idx, value in enumerate(row_data, start=1):
                 cell           = ws.cell(row=next_row, column=col_idx, value=value)
@@ -322,7 +507,6 @@ def log_unanswered_question(
 
 
 def unanswered_question_count() -> int:
-    """Return how many unanswered questions are logged (0 if file missing)."""
     try:
         if not os.path.exists(UNANSWERED_LOG_FILE):
             return 0
@@ -337,11 +521,6 @@ def unanswered_question_count() -> int:
 
 
 def _llm_replied_no_detail(answer: str) -> bool:
-    """
-    Return True only when the LLM answered with the
-    'I don't have that detail right now' fallback phrase.
-    This is the single trigger for logging to Excel.
-    """
     return _NO_DETAIL_PHRASE_EN in answer or _NO_DETAIL_PHRASE_TA in answer
 
 
@@ -459,6 +638,84 @@ load_default_pdf()
 # ROUTES
 # ─────────────────────────────────────────
 
+# ── Lead verification endpoint ────────────────────────────────────────────────
+@app.route("/verify-lead", methods=["POST"])
+@limiter.limit("20 per minute")
+@require_api_key
+def verify_lead():
+    """
+    Validate and store a user's name, email, country, and phone.
+    On success, marks the session as verified so /ask will work.
+    """
+    ip   = request.remote_addr
+    data = request.get_json(silent=True) or {}
+
+    session_id   = validate_session_id(str(data.get("session_id", "")))
+    name         = str(data.get("name",         "")).strip()
+    email        = str(data.get("email",        "")).strip()
+    country_code = str(data.get("country_code", "")).strip().upper()
+    phone        = re.sub(r"\D", "", str(data.get("phone", "")))
+    language     = str(data.get("language",     "english")).strip().lower()
+
+    if language not in ("english", "tamil"):
+        language = "english"
+
+    errors = {}
+
+    ok, msg = validate_name(name)
+    if not ok:
+        errors["name"] = msg
+
+    ok, msg = validate_email(email)
+    if not ok:
+        errors["email"] = msg
+
+    ok, msg = validate_phone(country_code, phone)
+    if not ok:
+        errors["phone"] = msg
+
+    if errors:
+        return jsonify({"success": False, "errors": errors, "session_id": session_id}), 422
+
+    # Store verified lead in memory
+    with _leads_lock:
+        _verified_leads[session_id] = {
+            "name":         name,
+            "email":        email.lower(),
+            "country_code": country_code,
+            "phone":        phone,
+            "language":     language,
+            "ip":           ip,
+            "verified_at":  time.time(),
+        }
+
+    # Persist to Excel
+    log_lead_to_excel(
+        name         = name,
+        email        = email.lower(),
+        country_code = country_code,
+        phone        = phone,
+        language     = language,
+        session_id   = session_id,
+        ip           = ip,
+    )
+
+    log.info("Lead verified: %s | %s | session: %s | ip: %s", name, email, session_id, ip)
+    return jsonify({"success": True, "session_id": session_id})
+
+
+def _session_is_verified(session_id: str) -> bool:
+    with _leads_lock:
+        lead = _verified_leads.get(session_id)
+        if not lead:
+            return False
+        # Expire after SESSION_TTL
+        if time.time() - lead["verified_at"] > SESSION_TTL:
+            del _verified_leads[session_id]
+            return False
+        return True
+
+
 @app.route("/ask", methods=["POST"])
 @limiter.limit("10 per minute")
 @require_api_key
@@ -466,12 +723,10 @@ def ask():
     ip   = request.remote_addr
     data = request.get_json(silent=True) or {}
 
-    # ── Input extraction ──────────────────
     question   = str(data.get("question",   "")).strip()
     language   = str(data.get("language",   "english")).strip().lower()
     session_id = validate_session_id(str(data.get("session_id", "")))
 
-    # ── Basic validation ──────────────────
     if not question:
         return jsonify({"error": "Please ask a question.", "session_id": session_id}), 400
 
@@ -484,17 +739,22 @@ def ask():
     if language not in ("english", "tamil"):
         language = "english"
 
-    # ── Sanitize ──────────────────────────
+    # ── Lead gate ─────────────────────────────────────────────────────────────
+    if not _session_is_verified(session_id):
+        return jsonify({
+            "error": "lead_required",
+            "message": "Please complete verification before chatting.",
+            "session_id": session_id,
+        }), 403
+
     question = sanitize_input(question)
     if not question:
         return jsonify({"error": "Invalid input. Please rephrase your question.", "session_id": session_id}), 400
 
-    # ── Small talk ────────────────────────
     small_talk = handle_small_talk(question, language)
     if small_talk:
         return jsonify({"answer": small_talk, "session_id": session_id})
 
-    # ── Document check ────────────────────
     if index is None:
         log.error("FAISS index is None — document not loaded.")
         return jsonify({"error": "Document not loaded. Please contact support.", "session_id": session_id}), 503
@@ -502,14 +762,12 @@ def ask():
     try:
         history = get_session_history(session_id)
 
-        # Enrich vague short queries with prior context
         search_query = question
         if len(question.split()) <= 5 and history:
             last_q       = history[-1]["question"]
             search_query = f"{last_q} {question}"
             log.info("Enriched search query: %s", search_query)
 
-        # ── FAISS retrieval ───────────────
         q_embed = embedding_model.encode(
             [search_query], convert_to_numpy=True
         ).astype("float32")
@@ -518,7 +776,6 @@ def ask():
         top_dist = float(distances[0][0])
         log.info("FAISS top distance: %.4f | session: %s | ip: %s", top_dist, session_id, ip)
 
-        # ── Not found → return early (no logging here) ────
         if top_dist > DISTANCE_THRESH:
             msg = (
                 "மன்னிக்கவில்லை, ஆவணத்தில் தொடர்புடைய தகவல் கிடைக்கவில்லை."
@@ -529,7 +786,6 @@ def ask():
 
         context = "\n\n".join(chunks[i] for i in indices_found[0] if i < len(chunks))
 
-        # ── Language instruction ──────────
         lang_instruction = (
             "Answer ONLY in Tamil. Use simple, polite Tamil. "
             "If the user writes in Tanglish, still reply in proper Tamil."
@@ -537,7 +793,6 @@ def ask():
             else "Answer ONLY in English. Be clear, concise, and professional."
         )
 
-        # ── Build messages ────────────────
         system_prompt = (
             f"You are a customer assistant for Uzhavar Sandhai Pvt Ltd (Virtual Farming - goat & sheep).\n"
             f"{lang_instruction}\n\n"
@@ -567,7 +822,6 @@ def ask():
             session_id, language, len(history), ip,
         )
 
-        # ── OpenAI call ───────────────────
         response = client.chat.completions.create(
             model       = OPENAI_MODEL,
             messages    = messages,
@@ -578,17 +832,20 @@ def ask():
 
         answer = response.choices[0].message.content.strip()
 
-        # ── Log to Excel ONLY when LLM replied "I don't have that detail" ──
         if _llm_replied_no_detail(answer):
+            # ── Fetch the verified lead's email for this session ──────────────
+            with _leads_lock:
+                lead_email = _verified_leads.get(session_id, {}).get("email", "")
+
             log_unanswered_question(
                 question   = question,
                 language   = language,
                 session_id = session_id,
                 ip         = ip,
                 distance   = top_dist,
+                email      = lead_email,   # ── passed here ──────────────────
             )
 
-        # ── Save session ──────────────────
         saved = create_or_update_session(session_id, question, answer, ip)
         if not saved:
             log.warning("Session not saved — cap reached for ip: %s", ip)
@@ -612,6 +869,9 @@ def clear_session():
     session_id = validate_session_id(str(data.get("session_id", "")))
 
     deleted = delete_session(session_id)
+    with _leads_lock:
+        _verified_leads.pop(session_id, None)
+
     log.info("Session clear: %s | deleted: %s | ip: %s", session_id, deleted, request.remote_addr)
     return jsonify({
         "status":     "Session cleared." if deleted else "Session not found.",
@@ -638,14 +898,9 @@ def reload_pdf():
 @app.route("/admin/unanswered")
 @limiter.limit("10 per hour")
 def download_unanswered():
-    """
-    Admin-only: download the unanswered questions Excel file.
-    Usage:  GET /admin/unanswered?token=YOUR_ADMIN_SECRET
-    """
     token = request.args.get("token", "").strip()
 
     if not ADMIN_SECRET:
-        log.error("/admin/unanswered called but ADMIN_SECRET is not set.")
         return jsonify({"error": "Admin access is not configured on the server."}), 503
 
     if not hmac.compare_digest(token, ADMIN_SECRET):
@@ -656,7 +911,6 @@ def download_unanswered():
         return jsonify({"error": "No unanswered questions have been logged yet."}), 404
 
     log.info("Admin downloaded unanswered questions log — ip: %s", request.remote_addr)
-
     download_name = f"unanswered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
     return send_file(
         UNANSWERED_LOG_FILE,
@@ -666,13 +920,38 @@ def download_unanswered():
     )
 
 
+@app.route("/admin/leads")
+@limiter.limit("10 per hour")
+def download_leads():
+    """
+    Admin-only: download the leads Excel file.
+    Usage:  GET /admin/leads?token=YOUR_ADMIN_SECRET
+    """
+    token = request.args.get("token", "").strip()
+
+    if not ADMIN_SECRET:
+        return jsonify({"error": "Admin access is not configured on the server."}), 503
+
+    if not hmac.compare_digest(token, ADMIN_SECRET):
+        log.warning("Unauthorized /admin/leads attempt from %s", request.remote_addr)
+        return jsonify({"error": "Unauthorized. Invalid or missing token."}), 401
+
+    if not os.path.exists(LEADS_LOG_FILE):
+        return jsonify({"error": "No leads have been collected yet."}), 404
+
+    log.info("Admin downloaded leads log — ip: %s", request.remote_addr)
+    download_name = f"leads_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return send_file(
+        LEADS_LOG_FILE,
+        as_attachment = True,
+        download_name = download_name,
+        mimetype      = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
 @app.route("/admin/stats")
 @limiter.limit("20 per hour")
 def admin_stats():
-    """
-    Admin-only: returns JSON stats (sessions, unanswered count, index status).
-    Usage:  GET /admin/stats?token=YOUR_ADMIN_SECRET
-    """
     token = request.args.get("token", "").strip()
 
     if not ADMIN_SECRET:
@@ -688,6 +967,7 @@ def admin_stats():
         "total_chunks":        len(chunks),
         "active_sessions":     active_session_count(),
         "unanswered_logged":   unanswered_question_count(),
+        "leads_collected":     leads_count(),
         "timestamp":           int(time.time()),
     })
 
@@ -695,7 +975,6 @@ def admin_stats():
 # ─────────────────────────────────────────
 @app.route("/health")
 def health():
-    """Public health check — no sensitive data exposed."""
     return jsonify({
         "status":          "ok",
         "index_ready":     index is not None,
@@ -704,7 +983,6 @@ def health():
     })
 
 
-# ─────────────────────────────────────────
 @app.route("/")
 def root():
     return "Uzhavar Sandhai Backend is Running ✅"
@@ -730,8 +1008,6 @@ def internal_error(e):
     return jsonify({"error": "Internal server error."}), 500
 
 
-# ─────────────────────────────────────────
-# ENTRY POINT  (dev only — use Gunicorn in prod)
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 4000))
