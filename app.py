@@ -26,7 +26,6 @@ from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from sentence_transformers import SentenceTransformer
 from openai import OpenAI
-os.environ["ALLOW_UNAUTHENTICATED"] = "true"
 
 # ─────────────────────────────────────────────────────────────
 # LOGGING
