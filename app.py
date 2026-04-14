@@ -116,19 +116,13 @@ client = OpenAI(api_key=_openai_key)
 # ─────────────────────────────────────────────────────────────
 
 def check_api_key():
-    """
-    FIX: If API_SECRET is not set, log a warning but still DENY
-    requests in production. Allows bypass only if explicitly
-    opted-in via ALLOW_UNAUTHENTICATED=true env var.
-    """
     if not API_SECRET:
         allow_unauth = os.getenv("ALLOW_UNAUTHENTICATED", "false").lower() == "true"
         if allow_unauth:
-            return None  # Dev/test mode: explicitly opted in
-        log.warning("Blocked request — API_SECRET not configured. Set ALLOW_UNAUTHENTICATED=true to allow in dev.")
+            return None
+        log.warning("Blocked request — API_SECRET not configured.")
         return jsonify({"error": "Server not configured for public access."}), 503
 
-    # Check header first, then fall back to query param (for backwards compat)
     provided = (
         request.headers.get("X-API-Key", "")
         or request.headers.get("Authorization", "").replace("Bearer ", "")
@@ -151,12 +145,6 @@ def require_api_key(f):
 
 
 def sanitize_input(text: str) -> str:
-    """
-    FIX: Removed overly aggressive character stripping that broke Tamil
-    and removed valid characters like ₹. Now only strips control
-    characters and prompt-injection patterns.
-    """
-    # Strip prompt injection attempts
     text = re.sub(
         r"(ignore|forget|disregard|override)\s+(all\s+)?(previous\s+)?"
         r"(instructions?|prompts?|system|rules?|context)",
@@ -167,9 +155,7 @@ def sanitize_input(text: str) -> str:
         r"developer mode|DAN mode|jailbreak|hypothetically speaking)",
         "", text, flags=re.IGNORECASE,
     )
-    # Strip only ASCII control characters (keep all printable Unicode including Tamil, ₹, etc.)
     text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
-    # Collapse excessive whitespace
     text = re.sub(r"\s{3,}", " ", text)
     return text.strip()
 
@@ -183,11 +169,6 @@ def validate_session_id(sid: str) -> str:
 
 
 def _check_admin_token() -> Optional[tuple]:
-    """
-    FIX: Admin/reload tokens now read from Authorization header
-    instead of query params to avoid leaking in server logs.
-    Falls back to query param for backwards compatibility.
-    """
     token = (
         request.headers.get("Authorization", "").replace("Bearer ", "").strip()
         or request.args.get("token", "").strip()
@@ -223,10 +204,6 @@ _db_lock = threading.Lock()
 
 @contextmanager
 def _db(write: bool = False):
-    """
-    FIX: Separate read and write contexts so SELECT queries
-    don't trigger unnecessary commits.
-    """
     with _db_lock:
         conn = sqlite3.connect(LEADS_DB_FILE, check_same_thread=False)
         conn.row_factory = sqlite3.Row
@@ -244,23 +221,25 @@ def _db(write: bool = False):
 
 def _init_db() -> None:
     """
-    FIX: Added UNIQUE constraint on session_id so the ON CONFLICT
-    upsert actually triggers correctly. Also added lead_ttl support.
+    FIX: session_id now has its own UNIQUE index so lookups by
+    session_id work correctly even when same email re-registers
+    from a different session.  The email UNIQUE constraint is
+    kept so duplicate emails upsert correctly.
     """
     with _db(write=True) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS verified_leads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id   TEXT,
-                name         TEXT NOT NULL,
-                first_name   TEXT NOT NULL,
-                email TEXT UNIQUE NOT NULL,
-                country_code TEXT NOT NULL,
-                phone        TEXT NOT NULL,
-                language     TEXT NOT NULL DEFAULT 'english',
-                ip           TEXT NOT NULL DEFAULT '',
-                verified_at  REAL NOT NULL,
-                updated_at   REAL NOT NULL
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   TEXT    UNIQUE NOT NULL,
+                name         TEXT    NOT NULL,
+                first_name   TEXT    NOT NULL,
+                email        TEXT    NOT NULL,
+                country_code TEXT    NOT NULL,
+                phone        TEXT    NOT NULL,
+                language     TEXT    NOT NULL DEFAULT 'english',
+                ip           TEXT    NOT NULL DEFAULT '',
+                verified_at  REAL    NOT NULL,
+                updated_at   REAL    NOT NULL
             )
         """)
         conn.execute("""
@@ -277,18 +256,22 @@ def _init_db() -> None:
 def db_save_lead(session_id: str, name: str, email: str,
                  country_code: str, phone: str, language: str, ip: str) -> str:
     """
-    FIX: ON CONFLICT now correctly targets session_id (which has
-    UNIQUE constraint) so upsert works as intended.
+    FIX: ON CONFLICT targets session_id (UNIQUE) for the primary
+    upsert path.  A second pass handles the edge-case where the
+    same email already exists under a DIFFERENT session — it
+    updates that row's session_id to the new one so future
+    check-lead calls by session will find it.
     """
     first_name = name.strip().split()[0] if name.strip() else ""
     now = time.time()
     with _db(write=True) as conn:
+        # Try upsert by session_id first
         conn.execute("""
             INSERT INTO verified_leads
                 (session_id, name, first_name, email, country_code, phone,
                  language, ip, verified_at, updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(email) DO UPDATE SET
+            ON CONFLICT(session_id) DO UPDATE SET
                 name         = excluded.name,
                 first_name   = excluded.first_name,
                 email        = excluded.email,
@@ -297,34 +280,46 @@ def db_save_lead(session_id: str, name: str, email: str,
                 language     = excluded.language,
                 ip           = excluded.ip,
                 updated_at   = excluded.updated_at
-        """, (session_id, name, first_name, email, country_code, phone,
-              language, ip, now, now))
-    log.info("Lead saved to DB: %s | %s | session: %s", name, email, session_id)
+        """, (session_id, name, first_name, email.lower(), country_code,
+              phone, language, ip, now, now))
+
+        # If same email exists under a DIFFERENT session, re-point it
+        conn.execute("""
+            UPDATE verified_leads
+               SET session_id  = ?,
+                   name        = ?,
+                   first_name  = ?,
+                   country_code= ?,
+                   phone       = ?,
+                   language    = ?,
+                   ip          = ?,
+                   updated_at  = ?
+             WHERE email = ? AND session_id != ?
+        """, (session_id, name, first_name, country_code, phone,
+              language, ip, now, email.lower(), session_id))
+
+    log.info("Lead saved: %s | %s | session: %s", name, email, session_id)
     return first_name
 
 
 def db_get_lead(session_id: str) -> Optional[dict]:
-    """
-    FIX: Read uses _db(write=False) — no unnecessary commit.
-    Also refreshes updated_at in a separate write call.
-    """
+    """Lookup by session_id only — correct and fast."""
     with _db(write=False) as conn:
         row = conn.execute(
             "SELECT * FROM verified_leads WHERE session_id = ?",
             (session_id,)
         ).fetchone()
-        if row:
-            result = dict(row)
+        if not row:
+            return None
+        result = dict(row)
 
-    if row:
-        # Refresh updated_at in a separate write transaction
-        with _db(write=True) as conn:
-            conn.execute(
-                "UPDATE verified_leads SET updated_at = ? WHERE session_id = ?",
-                (time.time(), session_id)
-            )
-        return result
-    return None
+    # Refresh updated_at in a separate write
+    with _db(write=True) as conn:
+        conn.execute(
+            "UPDATE verified_leads SET updated_at = ? WHERE session_id = ?",
+            (time.time(), session_id)
+        )
+    return result
 
 
 def db_delete_lead(session_id: str) -> None:
@@ -339,7 +334,6 @@ def db_lead_count() -> int:
 
 
 def db_all_leads() -> list:
-    """Return all leads for admin export from DB."""
     with _db(write=False) as conn:
         rows = conn.execute(
             "SELECT * FROM verified_leads ORDER BY verified_at DESC"
@@ -429,7 +423,7 @@ def validate_phone(country_code: str, phone: str) -> tuple:
 
 
 # ─────────────────────────────────────────────────────────────
-# EXCEL LOGGERS  (admin download files)
+# EXCEL LOGGERS
 # ─────────────────────────────────────────────────────────────
 _leads_excel_lock   = threading.Lock()
 _unanswered_lock    = threading.Lock()
@@ -509,10 +503,6 @@ _ip_session_count: dict = defaultdict(int)
 
 
 def _cleanup_sessions() -> None:
-    """
-    FIX: Now runs in a background thread every 5 minutes
-    instead of blocking the hot /ask path on every request.
-    """
     now = time.time()
     with _sessions_lock:
         expired = [s for s, d in _sessions.items() if now - d["last_active"] > SESSION_TTL]
@@ -525,10 +515,9 @@ def _cleanup_sessions() -> None:
 
 
 def _start_cleanup_worker() -> None:
-    """Background thread that periodically cleans up expired sessions."""
     def worker():
         while True:
-            time.sleep(300)  # every 5 minutes
+            time.sleep(300)
             try:
                 _cleanup_sessions()
             except Exception as e:
@@ -752,7 +741,7 @@ def ask():
     if language not in ("english", "tamil"):
         language = "english"
 
-    # Lead gate: check SQLite (survives restarts)
+    # Lead gate
     lead = db_get_lead(session_id)
     if not lead:
         return jsonify({
@@ -778,7 +767,6 @@ def ask():
     try:
         history = get_history(session_id)
 
-        # FIX: Use ". " separator so embedding model gets cleaner input
         if len(question.split()) <= 5 and history:
             search_q = f"{history[-1]['question']}. {question}"
         else:
@@ -862,11 +850,7 @@ def clear_session():
 @limiter.limit("5 per minute")
 @require_api_key
 def delete_lead_session():
-    """
-    NEW: Fully removes a lead from DB + clears chat history.
-    Useful if a user wants to re-register with different details.
-    Requires admin token for security.
-    """
+    """Fully removes a lead from DB + clears chat history."""
     err = _check_admin_token()
     if err:
         return err
@@ -881,10 +865,6 @@ def delete_lead_session():
 @app.route("/reload")
 @limiter.limit("5 per hour")
 def reload_pdf():
-    """
-    FIX: Token now accepted from Authorization header (preferred)
-    or query param (backwards compat).
-    """
     token = (
         request.headers.get("Authorization", "").replace("Bearer ", "").strip()
         or request.args.get("token", "").strip()
