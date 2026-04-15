@@ -116,21 +116,13 @@ client = OpenAI(api_key=_openai_key)
 # ─────────────────────────────────────────────────────────────
 
 def check_api_key():
+    """Validate X-API-Key header using constant-time comparison."""
     if not API_SECRET:
-        allow_unauth = os.getenv("ALLOW_UNAUTHENTICATED", "false").lower() == "true"
-        if allow_unauth:
-            return None
-        log.warning("Blocked request — API_SECRET not configured.")
-        return jsonify({"error": "Server not configured for public access."}), 503
-
-    provided = (
-        request.headers.get("X-API-Key", "")
-        or request.headers.get("Authorization", "").replace("Bearer ", "")
-    ).strip()
-
-    if not provided or not hmac.compare_digest(provided, API_SECRET):
+        return None
+    provided = request.headers.get("X-API-Key", "").strip()
+    if not hmac.compare_digest(provided, API_SECRET):
         log.warning("Unauthorized request from %s | path: %s", request.remote_addr, request.path)
-        return jsonify({"error": "Unauthorized."}), 401
+        return jsonify({"error": "Unauthorized. Invalid or missing API key."}), 401
     return None
 
 
@@ -221,16 +213,17 @@ def _db(write: bool = False):
 
 def _init_db() -> None:
     """
-    FIX: session_id now has its own UNIQUE index so lookups by
-    session_id work correctly even when same email re-registers
-    from a different session.  The email UNIQUE constraint is
-    kept so duplicate emails upsert correctly.
+    Creates the table if it doesn't exist, then ensures the
+    session_id UNIQUE index exists even on old databases that
+    were created before the constraint was added.
     """
     with _db(write=True) as conn:
+        # Create table WITHOUT any UNIQUE on session_id in the DDL —
+        # the uniqueness is enforced via the index below.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS verified_leads (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id   TEXT    UNIQUE NOT NULL,
+                session_id   TEXT    NOT NULL,
                 name         TEXT    NOT NULL,
                 first_name   TEXT    NOT NULL,
                 email        TEXT    NOT NULL,
@@ -242,8 +235,10 @@ def _init_db() -> None:
                 updated_at   REAL    NOT NULL
             )
         """)
+        # Add UNIQUE index safely — IF NOT EXISTS means it's safe to
+        # run on both fresh and existing (old-schema) databases.
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_leads_session
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_session
             ON verified_leads (session_id)
         """)
         conn.execute("""
@@ -256,44 +251,42 @@ def _init_db() -> None:
 def db_save_lead(session_id: str, name: str, email: str,
                  country_code: str, phone: str, language: str, ip: str) -> str:
     """
-    FIX: ON CONFLICT targets session_id (UNIQUE) for the primary
-    upsert path.  A second pass handles the edge-case where the
-    same email already exists under a DIFFERENT session — it
-    updates that row's session_id to the new one so future
-    check-lead calls by session will find it.
+    Uses INSERT OR REPLACE which works regardless of how the
+    UNIQUE constraint was originally declared (DDL vs index).
+    INSERT OR REPLACE deletes the conflicting row and inserts
+    a fresh one — verified_at is preserved via a SELECT first.
     """
     first_name = name.strip().split()[0] if name.strip() else ""
     now = time.time()
+
     with _db(write=True) as conn:
-        # Try upsert by session_id first
+        # Fetch existing verified_at so we don't overwrite it
+        existing = conn.execute(
+            "SELECT verified_at FROM verified_leads WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+        verified_at = existing["verified_at"] if existing else now
+
+        # INSERT OR REPLACE handles both insert and update atomically
         conn.execute("""
-            INSERT INTO verified_leads
+            INSERT OR REPLACE INTO verified_leads
                 (session_id, name, first_name, email, country_code, phone,
                  language, ip, verified_at, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(session_id) DO UPDATE SET
-                name         = excluded.name,
-                first_name   = excluded.first_name,
-                email        = excluded.email,
-                country_code = excluded.country_code,
-                phone        = excluded.phone,
-                language     = excluded.language,
-                ip           = excluded.ip,
-                updated_at   = excluded.updated_at
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (session_id, name, first_name, email.lower(), country_code,
-              phone, language, ip, now, now))
+              phone, language, ip, verified_at, now))
 
-        # If same email exists under a DIFFERENT session, re-point it
+        # Re-point any OTHER session that shares the same email
         conn.execute("""
             UPDATE verified_leads
-               SET session_id  = ?,
-                   name        = ?,
-                   first_name  = ?,
-                   country_code= ?,
-                   phone       = ?,
-                   language    = ?,
-                   ip          = ?,
-                   updated_at  = ?
+               SET session_id   = ?,
+                   name         = ?,
+                   first_name   = ?,
+                   country_code = ?,
+                   phone        = ?,
+                   language     = ?,
+                   ip           = ?,
+                   updated_at   = ?
              WHERE email = ? AND session_id != ?
         """, (session_id, name, first_name, country_code, phone,
               language, ip, now, email.lower(), session_id))
@@ -313,7 +306,7 @@ def db_get_lead(session_id: str) -> Optional[dict]:
             return None
         result = dict(row)
 
-    # Refresh updated_at in a separate write
+    # Refresh updated_at in a separate write connection
     with _db(write=True) as conn:
         conn.execute(
             "UPDATE verified_leads SET updated_at = ? WHERE session_id = ?",
